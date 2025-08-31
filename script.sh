@@ -57,7 +57,9 @@ cleanup() {
     ip link delete "$veth" 2>/dev/null || true
   done
   for alias_file in "${ALIASES[@]}"; do
-    rm -f "$alias_file"
+    if head -n 2 "$alias_file" 2>/dev/null | grep -q "Created by multi-vpn-manager"; then
+      rm -f "$alias_file"
+    fi
   done
   [ -n "$IP_FORWARD_BEFORE" ] && \
     sysctl -w net.ipv4.ip_forward="$IP_FORWARD_BEFORE" >/dev/null
@@ -100,17 +102,22 @@ create_namespace() {
   NS_LIST+=("$ns")
   VETH_LIST+=("$veth_br")
 
-  # создаём системный alias
+  # создаём системный alias-обёртку
   local wrapper="/usr/local/bin/$ns"
-  cat > "$wrapper" <<EOF
+  if [ -e "$wrapper" ]; then
+    echo "⚠️ Файл $wrapper уже существует! Обёртка не будет создана."
+  else
+    cat > "$wrapper" <<EOF
 #!/bin/bash
+# Created by multi-vpn-manager
 ip netns exec $ns "\$@"
 EOF
-  chmod +x "$wrapper"
-  ALIASES+=("$wrapper")
-
-  echo "✅ Namespace $ns готов. Используй: $ns <команда>"
+    chmod +x "$wrapper"
+    ALIASES+=("$wrapper")
+    echo "✅ Namespace $ns готов. Используй: $ns <команда>"
+  fi
 }
+
 
 kill_namespace() {
   local id=$1
@@ -132,26 +139,45 @@ kill_namespace() {
   remove_from_array VETH_LIST "$veth"
 
   local wrapper="/usr/local/bin/$ns"
-  rm -f "$wrapper"
-  remove_from_array ALIASES "$wrapper"
+  if [[ -f "$wrapper" ]] && head -n 2 "$wrapper" | grep -q "Created by multi-vpn-manager"; then
+    rm -f "$wrapper"
+    remove_from_array ALIASES "$wrapper"
+  fi
 
   echo "✅ $ns удалён"
 }
 
+
 list_namespaces() {
   echo "🌐 Текущие VPN namespace:"
   for ns in "${NS_LIST[@]}"; do
-    echo " - $ns"
+    local wrapper="/usr/local/bin/$ns"
+    if [[ -f "$wrapper" ]]; then
+      echo " - $ns (обёртка: $wrapper)"
+    else
+      echo " - $ns (обёртка отсутствует)"
+    fi
   done
 }
 
 status_namespaces() {
   for ns in "${NS_LIST[@]}"; do
-    echo -n "$ns → "
-    "$ns" curl -s --max-time 5 ifconfig.me || echo "нет ответа"
+    echo "🔎 [$ns]"
+    if command -v "$ns" &>/dev/null; then
+      echo -n "  IP: "
+      "$ns" curl -s --max-time 5 ifconfig.me || echo "нет ответа"
+
+      echo -n "  Default route: "
+      if ! "$ns" ip route show default 2>/dev/null | awk '{print $3; exit}'; then
+        echo "нет маршрута"
+      fi
+    else
+      echo "  обёртка отсутствует"
+    fi
   done
 }
 
+#init
 WAN_IFACE="${WAN_IFACE:-$(detect_wan_iface)}"
 if [ -z "$WAN_IFACE" ]; then
   echo "❌ Не удалось определить внешний интерфейс"
