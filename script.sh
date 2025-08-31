@@ -1,162 +1,111 @@
 #!/bin/bash
-
 set -euo pipefail
 
-if [ "$EUID" -ne 0 ]; then
-  echo "❌ Скрипт нужно запускать от root"
-  exit 1
-fi
-
-for dep in ip iptables curl; do
-  if ! command -v "$dep" &>/dev/null; then
-    echo "❌ Не найдено: $dep"
-    exit 1
-  fi
-done
-
 #Globals
-WAN_IFACE=""
-BASE_SUBNET=""
-NS_LIST=()
-RULES=()
-VETH_LIST=()
-ALIASES=()
-IP_FORWARD_BEFORE=""
+NS_LIST=()       # список namespace
+WRAPPERS=()      # список обёрточных файлов
+CLEANED_UP=false
 
-detect_wan_iface() {
-  ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' \
-    || ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' \
-    || ip -o link show up | awk -F': ' '{if ($2!="lo") {print $2; exit}}'
-}
-
-find_free_base_subnet() {
-  for n in $(seq 200 250); do
-    base="10.${n}"
-    if ! ip route | grep -q "^10\.${n}\."; then
-      echo "$base"; return
-    fi
-  done
-  echo ""
-}
-
-remove_from_array() {
-  local -n arr=$1
-  local val=$2
-  arr=($(printf "%s\n" "${arr[@]}" | grep -vx "$val"))
-}
 
 cleanup() {
+  if [ "$CLEANED_UP" = true ]; then
+    return
+  fi
+  CLEANED_UP=true
+
   echo "🧹 Очистка..."
   for ns in "${NS_LIST[@]}"; do
     ip netns del "$ns" 2>/dev/null || true
   done
-  for rule in "${RULES[@]}"; do
-    iptables -t nat -D POSTROUTING $rule 2>/dev/null || true
+
+  for wrapper in "${WRAPPERS[@]}"; do
+    rm -f "$wrapper"
   done
-  for veth in "${VETH_LIST[@]}"; do
-    ip link delete "$veth" 2>/dev/null || true
-  done
-  for alias_file in "${ALIASES[@]}"; do
-    if head -n 2 "$alias_file" 2>/dev/null | grep -q "Created by multi-vpn-manager"; then
-      rm -f "$alias_file"
-    fi
-  done
-  [ -n "$IP_FORWARD_BEFORE" ] && \
-    sysctl -w net.ipv4.ip_forward="$IP_FORWARD_BEFORE" >/dev/null
+
   echo "✅ Всё очищено"
 }
-trap cleanup INT TERM EXIT
+
+cleanup_and_exit() {
+  cleanup
+  exit 0
+}
+
+trap cleanup_and_exit INT TERM
+trap cleanup EXIT
+
+
+WAN_IF=$(ip route | grep '^default' | awk '{print $5}' | head -n1)
+if [[ -z "$WAN_IF" ]]; then
+  echo "❌ Не найден WAN интерфейс"
+  exit 1
+fi
+echo "🌐 WAN-интерфейс: $WAN_IF"
+
+BASE_SUBNET="10.200.0.0/16"
+echo "📡 Базовая подсеть: $BASE_SUBNET"
+
+# Включаем IP forward
+if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" -ne 1 ]]; then
+  echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward >/dev/null
+  echo "⚡ IP Forward включен"
+fi
+
 
 create_namespace() {
-  local id=$1
+  local id="$1"
   local ns="vpn$id"
-  local veth="veth$id"
-  local veth_br="veth${id}-br"
-  local subnet="${BASE_SUBNET}.${id}.0/24"
-  local host_ip="${BASE_SUBNET}.${id}.1"
-  local ns_ip="${BASE_SUBNET}.${id}.2"
-
-  if [[ " ${NS_LIST[*]} " == *" $ns "* ]]; then
-    echo "⚠️ Namespace $ns уже существует"
-    return
-  fi
+  local veth_host="veth_${ns}_host"
+  local veth_ns="veth_${ns}_ns"
+  local subnet="10.200.$id.0/24"
+  local ip_host="10.200.$id.1/24"
+  local ip_ns="10.200.$id.2/24"
 
   echo "➕ Создаю $ns"
 
   ip netns add "$ns"
+  ip link add "$veth_host" type veth peer name "$veth_ns"
+  ip link set "$veth_ns" netns "$ns"
 
-  ip link add "$veth_br" type veth peer name "$veth"
-  ip link set "$veth" netns "$ns"
+  ip addr add "$ip_host" dev "$veth_host"
+  ip link set "$veth_host" up
 
-  ip addr add "$host_ip/24" dev "$veth_br"
-  ip link set "$veth_br" up
-
-  ip netns exec "$ns" ip addr add "$ns_ip/24" dev "$veth"
-  ip netns exec "$ns" ip link set "$veth" up
+  ip netns exec "$ns" ip addr add "$ip_ns" dev "$veth_ns"
   ip netns exec "$ns" ip link set lo up
-  ip netns exec "$ns" ip route add default via "$host_ip"
+  ip netns exec "$ns" ip link set "$veth_ns" up
+  ip netns exec "$ns" ip route add default via 10.200.$id.1
 
-  iptables -t nat -A POSTROUTING -s "$subnet" -o "$WAN_IFACE" -j MASQUERADE
-  RULES+=("-s $subnet -o $WAN_IFACE -j MASQUERADE")
+  iptables -t nat -A POSTROUTING -s 10.200.$id.0/24 -o "$WAN_IF" -j MASQUERADE
+
+  # обёртка для обычного пользователя
+  local wrapper_user="/usr/local/bin/$ns"
+  cat > "$wrapper_user" <<EOF
+#!/bin/bash
+exec sudo -u "$USER" /sbin/ip netns exec $ns "\$@"
+EOF
+  chmod +x "$wrapper_user"
+
+  # обёртка для root
+  local wrapper_root="/usr/local/bin/${ns}-root"
+  cat > "$wrapper_root" <<EOF
+#!/bin/bash
+exec sudo /sbin/ip netns exec $ns "\$@"
+EOF
+  chmod +x "$wrapper_root"
 
   NS_LIST+=("$ns")
-  VETH_LIST+=("$veth_br")
+  WRAPPERS+=("$wrapper_user" "$wrapper_root")
 
-  # создаём системный alias-обёртку
-  local wrapper="/usr/local/bin/$ns"
-  if [ -e "$wrapper" ]; then
-    echo "⚠️ Файл $wrapper уже существует! Обёртка не будет создана."
-  else
-    cat > "$wrapper" <<EOF
-#!/bin/bash
-# Created by multi-vpn-manager
-ip netns exec $ns "\$@"
-EOF
-    chmod +x "$wrapper"
-    ALIASES+=("$wrapper")
-    echo "✅ Namespace $ns готов. Используй: $ns <команда>"
-  fi
+  echo "✅ Namespace $ns готов."
+  echo "   Используй: $ns <команда> (от юзера)"
+  echo "           или: ${ns}-root <команда> (от root)"
+  echo "   ⚠️ Убедись, что в sudoers есть правило:"
+  echo "     $USER ALL=(ALL:ALL) NOPASSWD: /sbin/ip netns exec *"
 }
-
-
-kill_namespace() {
-  local id=$1
-  local ns="vpn$id"
-  local veth="veth${id}-br"
-
-  echo "🗑 Удаляю $ns"
-  ip netns del "$ns" 2>/dev/null || true
-  ip link delete "$veth" 2>/dev/null || true
-
-  for i in "${!RULES[@]}"; do
-    if [[ "${RULES[$i]}" == *"$ns"* ]]; then
-      iptables -t nat -D POSTROUTING ${RULES[$i]} 2>/dev/null || true
-      unset 'RULES[i]'
-    fi
-  done
-
-  remove_from_array NS_LIST "$ns"
-  remove_from_array VETH_LIST "$veth"
-
-  local wrapper="/usr/local/bin/$ns"
-  if [[ -f "$wrapper" ]] && head -n 2 "$wrapper" | grep -q "Created by multi-vpn-manager"; then
-    rm -f "$wrapper"
-    remove_from_array ALIASES "$wrapper"
-  fi
-
-  echo "✅ $ns удалён"
-}
-
 
 list_namespaces() {
   echo "🌐 Текущие VPN namespace:"
   for ns in "${NS_LIST[@]}"; do
-    local wrapper="/usr/local/bin/$ns"
-    if [[ -f "$wrapper" ]]; then
-      echo " - $ns (обёртка: $wrapper)"
-    else
-      echo " - $ns (обёртка отсутствует)"
-    fi
+    echo " - $ns (/usr/local/bin/$ns, /usr/local/bin/${ns}-root)"
   done
 }
 
@@ -172,44 +121,32 @@ status_namespaces() {
         echo "нет маршрута"
       fi
     else
-      echo "  обёртка отсутствует"
+      echo "  обёртки отсутствуют"
     fi
   done
 }
 
-#init
-WAN_IFACE="${WAN_IFACE:-$(detect_wan_iface)}"
-if [ -z "$WAN_IFACE" ]; then
-  echo "❌ Не удалось определить внешний интерфейс"
-  exit 1
-fi
+print_help() {
+  echo -e "📖 Доступные команды:
+  <число>   — создать VPN namespace (например: 1 → vpn1 и vpn1-root)
+  list      — показать созданные VPN
+  status    — проверить IP и маршрут VPN
+  quit|exit — выйти из скрипта
+  help      — показать эту справку"
+}
 
-BASE_SUBNET="${BASE_SUBNET:-$(find_free_base_subnet)}"
-if [ -z "$BASE_SUBNET" ]; then
-  echo "❌ Нет свободной подсети (10.200.x.0/24)"
-  exit 1
-fi
 
-IP_FORWARD_BEFORE=$(sysctl -n net.ipv4.ip_forward)
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
+print_help
 
-echo "🌐 WAN-интерфейс: $WAN_IFACE"
-echo "📡 Базовая подсеть: $BASE_SUBNET.0.0/16"
-echo "⚡ IP Forward был $IP_FORWARD_BEFORE → теперь включен"
 
 while true; do
-  read -rp "Введите команду: " -a input
-  cmd="${input[0]:-}"
-  args=("${input[@]:1}")
-
+  read -rp "Введите команду (help для справки): " cmd
   case "$cmd" in
-    '' ) ;;
     [0-9]*) create_namespace "$cmd" ;;
     list)   list_namespaces ;;
     status) status_namespaces ;;
-    kill)   kill_namespace "${args[0]}" ;;
-    help)   echo "Доступные команды: <число>, list, status, kill <id>, help, exit" ;;
-    exit|quit) break ;;
-    *) echo "❓ Неизвестная команда: $cmd" ;;
+    help)   print_help ;;
+    quit|exit) break ;;
+    *) echo "❓ Неизвестная команда (см. help)" ;;
   esac
 done
